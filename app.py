@@ -4,7 +4,7 @@ import os
 import pickle
 import warnings
 import xml.etree.ElementTree as ET
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import holidays
@@ -12,6 +12,7 @@ import numpy as np
 import pandas as pd
 import requests
 from fastapi import FastAPI, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 warnings.filterwarnings("ignore")
@@ -27,7 +28,14 @@ WEATHER_URL_TEMPLATE = os.getenv(
     "http://openaccess.pf.api.met.ie/metno-wdb2ts/locationforecast?lat={lat};long={lon}",
 )
 
-app = FastAPI(title="Power Forecast API", version="2.0.0")
+app = FastAPI(title="Power Forecast API", version="2.1.0")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 model: Any = None
 trend_df: pd.DataFrame | None = None
@@ -47,6 +55,10 @@ SEVERE_CODES = {
     64, 20, 95, 21, 91, 23, 24, 34, 35, 93, 89,
 }
 EXTREME_CODES = {57, 65, 22, 92, 94, 96, 97, 98, 99, 90}
+
+dashboard_cache: dict[str, Any] | None = None
+dashboard_cache_time: datetime | None = None
+DASHBOARD_CACHE_TTL = timedelta(minutes=5)
 
 
 class HealthResponse(BaseModel):
@@ -103,7 +115,7 @@ class DailySummaryResponse(BaseModel):
 
 
 def now_utc() -> str:
-    return datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
 def load_pickle(path: str) -> Any:
@@ -253,7 +265,7 @@ def _extract_symbol_name(attrs: dict[str, Any], symbol_number: float = np.nan) -
 def fetch_weather(lat: float, lon: float) -> pd.DataFrame:
     try:
         url = WEATHER_URL_TEMPLATE.format(lat=lat, lon=lon)
-        response = requests.get(url, timeout=20)
+        response = requests.get(url, timeout=8)
         response.raise_for_status()
         root = ET.fromstring(response.text)
 
@@ -275,6 +287,7 @@ def fetch_weather(lat: float, lon: float) -> pd.DataFrame:
 
             for c in t.iter():
                 tag_c = _strip_ns(c.tag)
+
                 if tag_c == "temperature" and "value" in c.attrib:
                     temp = _safe_float(c.attrib.get("value"))
 
@@ -298,6 +311,7 @@ def fetch_weather(lat: float, lon: float) -> pd.DataFrame:
 
             if pd.notna(temp):
                 instant_rows.append({"datetime": from_ts, "temp": temp})
+
             if pd.notna(symbol_number) or symbol_name is not None:
                 symbol_rows.append(
                     {
@@ -354,6 +368,7 @@ def fetch_weather(lat: float, lon: float) -> pd.DataFrame:
 
         df["symbol_name"] = df.apply(_final_symbol_name, axis=1)
         return df.set_index("datetime").sort_index()
+
     except Exception:
         return pd.DataFrame()
 
@@ -676,7 +691,18 @@ def daily_summary_endpoint(
 
 @app.get("/dashboard", response_model=DashboardResponse)
 def dashboard(lat: float = Query(53.34), lon: float = Query(-6.26)) -> DashboardResponse:
+    global dashboard_cache, dashboard_cache_time
+
     try:
+        now = datetime.now(timezone.utc)
+
+        if (
+            dashboard_cache is not None
+            and dashboard_cache_time is not None
+            and now - dashboard_cache_time < DASHBOARD_CACHE_TTL
+        ):
+            return DashboardResponse(**dashboard_cache)
+
         next_hour_df = forecast(hours=1, lat=lat, lon=lon)
         day_df = forecast(hours=24, lat=lat, lon=lon)
         week_df = forecast(hours=24 * 7, lat=lat, lon=lon)
@@ -687,14 +713,20 @@ def dashboard(lat: float = Query(53.34), lon: float = Query(-6.26)) -> Dashboard
         peak_ts = day_df.index[peak_idx]
         peak_time = peak_ts.strftime("%H:%M")
 
-        return DashboardResponse(
-            next_hour=round(float(next_hour_df["forecast"].iloc[0]), 1),
-            tomorrow_total=round(float(day_df["forecast"].sum()), 1),
-            next_7_days=round(float(week_df["forecast"].sum()), 1),
-            peak_time=peak_time,
-            peak_value=round(float(peak_value), 1),
-            hourly=hourly,
-            generated_at=now_utc(),
-        )
+        result = {
+            "next_hour": round(float(next_hour_df["forecast"].iloc[0]), 1),
+            "tomorrow_total": round(float(day_df["forecast"].sum()), 1),
+            "next_7_days": round(float(week_df["forecast"].sum()), 1),
+            "peak_time": peak_time,
+            "peak_value": round(float(peak_value), 1),
+            "hourly": hourly,
+            "generated_at": now_utc(),
+        }
+
+        dashboard_cache = result
+        dashboard_cache_time = now
+
+        return DashboardResponse(**result)
+
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"dashboard failed: {exc}") from exc
