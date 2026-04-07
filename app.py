@@ -28,7 +28,7 @@ WEATHER_URL_TEMPLATE = os.getenv(
     "http://openaccess.pf.api.met.ie/metno-wdb2ts/locationforecast?lat={lat};long={lon}",
 )
 
-app = FastAPI(title="Power Forecast API", version="2.2.0")
+app = FastAPI(title="Power Forecast API", version="2.3.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -219,7 +219,7 @@ def time_features(ts: pd.Timestamp) -> dict[str, float | int]:
         "hour_sin": np.sin(2 * np.pi * h / 24),
         "hour_cos": np.cos(2 * np.pi * h / 24),
         "dow_sin": np.sin(2 * np.pi * d / 7),
-        "dow_cos": np.sin(2 * np.pi * d / 7 + np.pi / 2),  # preserves original dimensionality
+        "dow_cos": np.sin(2 * np.pi * d / 7 + np.pi / 2),
         "month_sin": np.sin(2 * np.pi * m / 12),
         "month_cos": np.cos(2 * np.pi * m / 12),
         "is_monday": int(d == 0),
@@ -431,8 +431,12 @@ def prepare_weather_for_index(weather_df: pd.DataFrame, target_index: pd.Datetim
 
 def get_forecast_start(hours: int) -> pd.Timestamp:
     now = pd.Timestamp.now().tz_localize(None)
+
+    # 下一小时预测、未来24小时预测：都从当前整点后的下一小时开始
     if hours in [1, 24]:
         return now.floor("H") + pd.Timedelta(hours=1)
+
+    # 未来7天及更长周期：从明天 00:00 开始
     return now.normalize() + pd.Timedelta(days=1)
 
 
@@ -706,11 +710,14 @@ def dashboard(lat: float = Query(53.34), lon: float = Query(-6.26)) -> Dashboard
         ):
             return DashboardResponse(**dashboard_cache)
 
-        # 只算一次 168 小时，提高速度且保证所有指标来自同一批真实预测结果
-        all_df = forecast(hours=24 * 7, lat=lat, lon=lon)
-        next_hour_df = all_df.iloc[:1]
-        day_df = all_df.iloc[:24]
-        week_df = all_df
+        # 1) 下一小时：真正用 forecast(1)
+        next_hour_df = forecast(hours=1, lat=lat, lon=lon)
+
+        # 2) 未来24小时：真正用 forecast(24)，从当前下一小时开始
+        day_df = forecast(hours=24, lat=lat, lon=lon)
+
+        # 3) 未来7天：真正用 forecast(168)，从明天 00:00 开始
+        week_df = forecast(hours=24 * 7, lat=lat, lon=lon)
 
         hourly = [round(float(v), 1) for v in day_df["forecast"].tolist()]
         hourly_points = [
